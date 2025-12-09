@@ -43,7 +43,7 @@ class FoodMenuDto(BaseModel):
     averageRating: Optional[float] = None
 
 class RestAreaDto(BaseModel):
-    restAreaId: str # ID 타입을 String으로 변경 (CSV와 매칭 위해)
+    restAreaId: int # ID 타입을 String으로 변경 (CSV와 매칭 위해)
     name: str
     routeName: str
     latitude: float
@@ -62,7 +62,7 @@ class RecommendationRequest(BaseModel):
     user_preference: str = "meal"
 
 class RecommendationResponse(BaseModel):
-    restAreaId: str
+    restAreaId: int
     restAreaName: str
     recommendedMenu: str
     menuPrice: int
@@ -76,10 +76,10 @@ app = FastAPI()
 
 def get_sales_rank(rest_area_id: str, menu_name: str) -> int:
     # 맵에서 순위 조회, 없으면 999위 반환
-    key = (rest_area_id, menu_name.replace(" ", ""))
+    key = (str(rest_area_id), menu_name.replace(" ", ""))
     return sales_rank_map.get(key, 999)
 
-def calculate_menu_score(rest_area_id: str, menu: FoodMenuDto, route_data: RouteData, preference: str) -> (float, str):
+def calculate_menu_score(rest_area_id: int, menu: FoodMenuDto, route_data: RouteData, preference: str) -> (float, str):
     score = 0.0
     reasons = []
     menu_name = menu.name
