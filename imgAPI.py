@@ -1,101 +1,148 @@
-import requests
-import pymysql
+import psycopg2
 import time
+import random
 import re
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
-# ----------------- 설정 -----------------
-# 네이버 API 키
-NAVER_CLIENT_ID = "dm6GBOvjE6THfBRMEi5W"
-NAVER_CLIENT_SECRET = "1ckwAVvELt"
-
-# DB 접속 정보 (Spring Boot application.properties 참고)
+# ==================== 설정 ====================
 DB_HOST = "localhost"
-DB_PORT = 3306
-DB_USER = "root"
+DB_PORT = "5432"
+DB_NAME = "road_taste" # 본인 DB명 확인!
+DB_USER = "postgres"
 DB_PASSWORD = "1234"
-DB_NAME = "road_taste" # 실제 DB 이름
-# ----------------------------------------
+# ============================================
 
 def get_db_connection():
-    return pymysql.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db=DB_NAME, charset='utf8mb4'
+    return psycopg2.connect(
+        host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT
     )
 
-def search_naver_image(query):
-    url = "https://openapi.naver.com/v1/search/image"
-    headers = {
-        "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
-    }
-    # 정확도보다는 퀄리티(filter=medium)와 유사도(sim) 기준
-    params = {"query": query, "display": 1, "sort": "sim", "filter": "medium"}
+def setup_driver():
+    """셀레니움 크롬 드라이버 설정"""
+    chrome_options = Options()
+    # chrome_options.add_argument("--headless")  # 브라우저 창 안 띄우려면 주석 해제
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    # 네이버가 봇으로 인식하지 않게 User-Agent 설정
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
+
+def refine_keyword(raw_name):
+    """검색어 최적화 (기존 로직 유지)"""
+    if "휴게소" not in raw_name:
+        return raw_name
+    match = re.match(r'(.*?)\((.*?)\)휴게소', raw_name)
+    if match:
+        base_name = match.group(1).strip()
+        direction = match.group(2).strip()
+        return f"{base_name}휴게소 {direction}방향"
+    return raw_name
+
+def crawl_naver_selenium(driver, query):
+    """셀레니움으로 네이버 검색 결과 크롤링"""
+    search_url = f"https://search.naver.com/search.naver?where=nexearch&sm=top_hty&fbm=0&ie=utf8&query={query}"
+    driver.get(search_url)
+    
+    image_url = None
+    phone = None
     
     try:
-        res = requests.get(url, headers=headers, params=params)
-        if res.status_code == 200:
-            data = res.json()
-            if data['items']:
-                return data['items'][0]['link']
+        # 데이터가 로딩될 때까지 최대 3초 대기
+        wait = WebDriverWait(driver, 3)
+        
+        # 1. 이미지 찾기 (여러가지 CSS 선택자 시도)
+        # 네이버 플레이스 영역의 이미지가 로딩되길 기다림
+        try:
+            # Case A: 일반적인 플레이스 썸네일
+            img_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".api_subject_bx .thumb_area img")))
+            image_url = img_element.get_attribute("src")
+        except:
+            try:
+                # Case B: 다른 레이아웃 (place_section)
+                img_element = driver.find_element(By.CSS_SELECTOR, ".place_section .rd_thumb img")
+                image_url = img_element.get_attribute("src")
+            except:
+                try:
+                    # Case C: 이미지 탭 미리보기
+                    img_element = driver.find_element(By.CSS_SELECTOR, ".img_area img")
+                    image_url = img_element.get_attribute("src")
+                except:
+                    pass
+
+        # 2. 전화번호 찾기 (API 없이 화면에서 긁어오기)
+        try:
+            # '전화번호 복사' 버튼 근처나 텍스트 찾기
+            # 보통 class="tell" 또는 0507, 02 등으로 시작하는 텍스트
+            tel_candidates = driver.find_elements(By.XPATH, "//*[contains(text(), '-')]")
+            for cand in tel_candidates:
+                text = cand.text.strip()
+                # 전화번호 형식 정규식 (02-1234-5678, 031-123-4567 등)
+                if re.match(r'^\d{2,3}-\d{3,4}-\d{4}$', text):
+                    phone = text
+                    break
+        except:
+            pass
+
     except Exception as e:
-        print(f"Error searching {query}: {e}")
-    return None
+        print(f"   [Error] 크롤링 중 오류: {e}")
 
-def update_rest_area_images():
+    return image_url, phone
+
+def update_rest_area_data():
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cur = conn.cursor()
+    driver = setup_driver() # 브라우저 실행
     
-    # 이미지가 없는 휴게소 조회 (테이블명 rest_area 가정)
-    # image_url 컬럼이 없다면 DB에 먼저 추가해야 함: ALTER TABLE rest_area ADD COLUMN image_url VARCHAR(1000);
-    cursor.execute("SELECT rest_area_id, name FROM rest_area WHERE image_url IS NULL OR image_url = ''")
-    areas = cursor.fetchall()
+    print(">>> 업데이트 대상 휴게소를 조회합니다...")
+    # 실패했거나 빈 데이터 다시 시도
+    cur.execute("""
+        SELECT rest_area_id, name 
+        FROM rest_areas 
+        ORDER BY rest_area_id ASC
+    """)
     
-    print(f"--- 휴게소 이미지 업데이트 대상: {len(areas)}개 ---")
+    rows = cur.fetchall()
+    total = len(rows)
+    print(f">>> 총 {total}개 작업 시작 (Selenium 방식)\n")
     
-    for area_id, name in areas:
-        # 검색어: "기흥휴게소 전경"
-        keyword = f"{name} 전경"
-        image_url = search_naver_image(keyword)
+    for i, (area_id, raw_name) in enumerate(rows):
+        search_name = refine_keyword(raw_name)
+        print(f"[{i+1}/{total}] '{search_name}' 검색 중...", end=" ", flush=True)
         
-        if image_url:
-            print(f"[UPDATE] {name}: {image_url}")
-            cursor.execute("UPDATE rest_area SET image_url = %s WHERE rest_area_id = %s", (image_url, area_id))
+        img, tel = crawl_naver_selenium(driver, search_name)
+        
+        # 값이 구해진 경우에만 업데이트 (기존 값 덮어쓰기 방지 로직 필요시 수정)
+        if img or tel:
+            update_sql = """
+                UPDATE rest_areas 
+                SET 
+                    image_url = COALESCE(%s, image_url), 
+                    tel = COALESCE(%s, tel)
+                WHERE rest_area_id = %s
+            """
+            cur.execute(update_sql, (img, tel, area_id))
             conn.commit()
-        else:
-            print(f"[FAIL] {name}")
         
-        time.sleep(0.1) # API 제한 고려
+        res_img = "O" if img else "X"
+        res_tel = tel if tel else "X"
+        print(f"-> [이미지: {res_img}, 전화: {res_tel}]")
         
-    conn.close()
+        # 봇 탐지 방지 딜레이
+        time.sleep(random.uniform(1.0, 2.0))
 
-def update_food_menu_images():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 이미지가 없는 메뉴 조회 (테이블명 food_menu 가정)
-    cursor.execute("SELECT menu_id, name FROM food_menu WHERE image_url IS NULL OR image_url = ''")
-    menus = cursor.fetchall()
-    
-    print(f"--- 메뉴 이미지 업데이트 대상: {len(menus)}개 ---")
-    
-    for menu_id, name in menus:
-        # 검색어 정제: 특수문자 제거
-        clean_name = re.sub(r'\([^)]*\)', '', name).strip() # (돈가스잔치) 등 제거
-        image_url = search_naver_image(clean_name)
-        
-        if image_url:
-            print(f"[UPDATE] {clean_name}: {image_url}")
-            cursor.execute("UPDATE food_menu SET image_url = %s WHERE menu_id = %s", (image_url, menu_id))
-            conn.commit()
-        else:
-            print(f"[FAIL] {clean_name}")
-            
-        time.sleep(0.1)
-
+    driver.quit() # 브라우저 종료
+    cur.close()
     conn.close()
+    print("\n>>> 완료!")
 
 if __name__ == "__main__":
-    # 1. 휴게소 이미지 업데이트
-    update_rest_area_images()
-    
-    # 2. 메뉴 이미지 업데이트
-    update_food_menu_images()
+    update_rest_area_data()
